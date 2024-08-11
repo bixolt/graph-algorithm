@@ -1,0 +1,1059 @@
+import heapq
+import math
+import matplotlib.pyplot as plt
+import networkx as nx
+import tkinter as tk
+from tkinter import simpledialog, messagebox, filedialog
+import json
+from threading import Thread, Lock
+from collections import deque, defaultdict
+import boto3
+from concurrent.futures import ThreadPoolExecutor
+import itertools
+import xml.etree.ElementTree as ET
+import numpy as np
+import random
+from cachetools import LRUCache, cached
+import sqlite3
+import websockets
+import asyncio
+import tensorflow as tf  # For ML integration
+from flask import Flask, jsonify  # For analytics dashboard
+
+class Graph:
+    def __init__(self, directed=True):
+        """Initialize a graph. By default, it's directed."""
+        self.edges = defaultdict(list)
+        self.vertices = set()
+        self.directed = directed
+        self.history = []
+        self.redo_history = []
+        self.lock = Lock()
+        self.cache = LRUCache(maxsize=100)
+        self.db_conn = sqlite3.connect('graph_history.db')
+        self.create_history_table()
+
+    def create_history_table(self):
+        """Create a history table in the database."""
+        with self.db_conn:
+            self.db_conn.execute('''CREATE TABLE IF NOT EXISTS history (
+                                    id INTEGER PRIMARY KEY,
+                                    operation TEXT,
+                                    data TEXT
+                                )''')
+
+    def save_to_history(self, operation, data):
+        """Save an operation to the history table."""
+        with self.db_conn:
+            self.db_conn.execute('INSERT INTO history (operation, data) VALUES (?, ?)', 
+                                 (operation, json.dumps(data)))
+
+    def add_edge(self, from_vertex, to_vertex, weight, bidirectional=False):
+        """Add an edge between two vertices with a given weight."""
+        with self.lock:
+            self.history.append(('remove_edge', from_vertex, to_vertex))
+            self.redo_history.clear()
+            self.edges[from_vertex].append((to_vertex, weight))
+            if bidirectional:
+                self.edges[to_vertex].append((from_vertex, weight))
+            self.vertices.update([from_vertex, to_vertex])
+            self.save_to_history('add_edge', {'from': from_vertex, 'to': to_vertex, 'weight': weight})
+
+    def remove_edge(self, from_vertex, to_vertex):
+        """Remove an edge between two vertices."""
+        with self.lock:
+            weight = self.get_edge_weight(from_vertex, to_vertex)
+            self.history.append(('add_edge', from_vertex, to_vertex, weight))
+            self.redo_history.clear()
+            self.edges[from_vertex] = [(v, w) for v, w in self.edges[from_vertex] if v != to_vertex]
+            if not self.directed:
+                self.edges[to_vertex] = [(v, w) for v, w in self.edges[to_vertex] if v != from_vertex]
+
+    def remove_vertex(self, vertex):
+        """Remove a vertex and all associated edges."""
+        with self.lock:
+            self.history.append(('add_vertex', vertex, self.edges[vertex]))
+            self.redo_history.clear()
+            if vertex in self.edges:
+                del self.edges[vertex]
+            for v in self.edges:
+                self.edges[v] = [(u, w) for u, w in self.edges[v] if u != vertex]
+            self.vertices.discard(vertex)
+
+    def update_edge(self, from_vertex, to_vertex, weight):
+        """Update the weight of an existing edge."""
+        with self.lock:
+            current_weight = self.get_edge_weight(from_vertex, to_vertex)
+            self.history.append(('update_edge', from_vertex, to_vertex, current_weight))
+            self.redo_history.clear()
+            self.edges[from_vertex] = [(v, w) if v != to_vertex else (v, weight) for v, w in self.edges[from_vertex]]
+
+    def undo(self):
+        """Undo the last operation."""
+        if not self.history:
+            return
+        with self.lock:
+            last_operation = self.history.pop()
+            operation = last_operation[0]
+            self.redo_history.append(last_operation)
+
+            if operation == 'add_edge':
+                self.add_edge(last_operation[1], last_operation[2], last_operation[3])
+            elif operation == 'remove_edge':
+                self.remove_edge(last_operation[1], last_operation[2])
+            elif operation == 'add_vertex':
+                self.add_vertex(last_operation[1])
+                for (neighbor, weight) in last_operation[2]:
+                    self.add_edge(last_operation[1], neighbor, weight)
+            elif operation == 'update_edge':
+                self.update_edge(last_operation[1], last_operation[2], last_operation[3])
+
+    def redo(self):
+        """Redo the last undone operation."""
+        if not self.redo_history:
+            return
+        with self.lock:
+            last_operation = self.redo_history.pop()
+            self.history.append(last_operation)
+
+            if last_operation[0] == 'remove_edge':
+                self.remove_edge(last_operation[1], last_operation[2])
+            elif last_operation[0] == 'add_edge':
+                self.add_edge(last_operation[1], last_operation[2], last_operation[3])
+            elif last_operation[0] == 'add_vertex':
+                self.remove_vertex(last_operation[1])
+            elif last_operation[0] == 'update_edge':
+                self.update_edge(last_operation[1], last_operation[2], last_operation[3])
+
+    def get_edge_weight(self, from_vertex, to_vertex):
+        """Get the weight of an edge."""
+        for v, w in self.edges[from_vertex]:
+            if v == to_vertex:
+                return w
+        return None
+
+    @cached(cache=LRUCache(maxsize=100))
+    def dijkstra(self, start):
+        """Find shortest paths from start vertex using Dijkstra's algorithm."""
+        distances = {vertex: float('infinity') for vertex in self.vertices}
+        distances[start] = 0
+        priority_queue = [(0, start)]
+
+        while priority_queue:
+            current_distance, current_vertex = heapq.heappop(priority_queue)
+
+            if current_distance > distances[current_vertex]:
+                continue
+
+            for neighbor, weight in self.edges[current_vertex]:
+                distance = current_distance + weight
+
+                if distance < distances[neighbor]:
+                    distances[neighbor] = distance
+                    heapq.heappush(priority_queue, (distance, neighbor))
+
+        return distances
+
+    def floyd_warshall(self):
+        """Find shortest paths between all pairs of vertices using Floyd-Warshall algorithm."""
+        distances = {v: {u: float('infinity') for u in self.vertices} for v in self.vertices}
+        for v in self.vertices:
+            distances[v][v] = 0
+        for v in self.edges:
+            for u, w in self.edges[v]:
+                distances[v][u] = w
+        for k in self.vertices:
+            for i in self.vertices:
+                for j in self.vertices:
+                    if distances[i][j] > distances[i][k] + distances[k][j]:
+                        distances[i][j] = distances[i][k] + distances[k][j]
+        return distances
+
+    def bellman_ford(self, start):
+        """Find shortest paths from start vertex using Bellman-Ford algorithm."""
+        distances = {vertex: float('infinity') for vertex in self.vertices}
+        distances[start] = 0
+
+        for _ in range(len(self.vertices) - 1):
+            for vertex in self.edges:
+                for neighbor, weight in self.edges[vertex]:
+                    if distances[vertex] + weight < distances[neighbor]:
+                        distances[neighbor] = distances[vertex] + weight
+
+        for vertex in self.edges:
+            for neighbor, weight in self.edges[vertex]:
+                if distances[vertex] + weight < distances[neighbor]:
+                    raise ValueError("Graph contains a negative-weight cycle")
+
+        return distances
+
+    def a_star(self, start, goal, heuristic):
+        """Find the shortest path using A* algorithm with a heuristic function."""
+        open_set = [(0, start)]
+        came_from = {}
+        g_score = {vertex: float('infinity') for vertex in self.vertices}
+        g_score[start] = 0
+        f_score = {vertex: float('infinity') for vertex in self.vertices}
+        f_score[start] = heuristic(start, goal)
+
+        while open_set:
+            _, current = heapq.heappop(open_set)
+
+            if current == goal:
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.append(start)
+                return path[::-1]
+
+            for neighbor, weight in self.edges[current]:
+                tentative_g_score = g_score[current] + weight
+
+                if tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = g_score[neighbor] + heuristic(neighbor, goal)
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+        raise ValueError("No path found")
+
+    def find_connected_components(self):
+        """Find and return all connected components in the graph."""
+        def dfs(vertex, visited, component):
+            visited.add(vertex)
+            component.append(vertex)
+            for neighbor, _ in self.edges[vertex]:
+                if neighbor not in visited:
+                    dfs(neighbor, visited, component)
+
+        visited = set()
+        components = []
+        for vertex in self.vertices:
+            if vertex not in visited:
+                component = []
+                dfs(vertex, visited, component)
+                components.append(component)
+
+        return components
+
+    def is_bipartite(self):
+        """Check if the graph is bipartite."""
+        color = {}
+        for vertex in self.vertices:
+            if vertex not in color:
+                queue = [vertex]
+                color[vertex] = 0
+                while queue:
+                    u = queue.pop(0)
+                    for neighbor, _ in self.edges[u]:
+                        if neighbor not in color:
+                            color[neighbor] = 1 - color[u]
+                            queue.append(neighbor)
+                        elif color[neighbor] == color[u]:
+                            return False
+        return True
+
+    def save_graph(self, filename):
+        """Save the graph structure to a file in JSON format."""
+        graph_data = {
+            'vertices': list(self.vertices),
+            'edges': dict(self.edges),
+            'directed': self.directed
+        }
+        with open(filename, 'w') as file:
+            json.dump(graph_data, file)
+
+    def load_graph(self, filename):
+        """Load a graph structure from a file in JSON format."""
+        with open(filename, 'r') as file:
+            graph_data = json.load(file)
+            self.vertices = set(graph_data['vertices'])
+            self.edges = defaultdict(list, graph_data['edges'])
+            self.directed = graph_data['directed']
+
+    def save_to_csv(self, filename):
+        """Save the graph structure to a CSV file."""
+        with open(filename, 'w') as file:
+            file.write("from_vertex,to_vertex,weight\n")
+            for vertex, neighbors in self.edges.items():
+                for neighbor, weight in neighbors:
+                    file.write(f"{vertex},{neighbor},{weight}\n")
+
+    def load_from_csv(self, filename):
+        """Load a graph structure from a CSV file."""
+        with open(filename, 'r') as file:
+            self.vertices.clear()
+            self.edges.clear()
+            next(file)  # Skip header
+            for line in file:
+                from_vertex, to_vertex, weight = line.strip().split(',')
+                weight = float(weight)
+                self.add_edge(from_vertex, to_vertex, weight)
+
+    def save_to_xml(self, filename):
+        """Save the graph structure to an XML file."""
+        root = ET.Element("graph")
+        root.set("directed", str(self.directed))
+        for vertex in self.vertices:
+            vertex_element = ET.SubElement(root, "vertex", name=vertex)
+            for neighbor, weight in self.edges[vertex]:
+                ET.SubElement(vertex_element, "edge", to=neighbor, weight=str(weight))
+        tree = ET.ElementTree(root)
+        tree.write(filename)
+
+    def load_from_xml(self, filename):
+        """Load a graph structure from an XML file."""
+        tree = ET.parse(filename)
+        root = tree.getroot()
+        self.directed = root.get("directed") == "True"
+        self.vertices.clear()
+        self.edges.clear()
+        for vertex_element in root:
+            vertex = vertex_element.get("name")
+            self.vertices.add(vertex)
+            for edge_element in vertex_element:
+                neighbor = edge_element.get("to")
+                weight = float(edge_element.get("weight"))
+                self.add_edge(vertex, neighbor, weight)
+
+    def save_to_binary(self, filename):
+        """Save the graph structure to a binary file."""
+        with open(filename, 'wb') as file:
+            np.save(file, dict(self.edges))
+            np.save(file, list(self.vertices))
+            np.save(file, self.directed)
+
+    def load_from_binary(self, filename):
+        """Load a graph structure from a binary file."""
+        with open(filename, 'rb') as file:
+            self.edges = defaultdict(list, np.load(file, allow_pickle=True).item())
+            self.vertices = set(np.load(file, allow_pickle=True))
+            self.directed = np.load(file, allow_pickle=True).item()
+
+    def save_checkpoint(self):
+        """Save a checkpoint for the current graph state."""
+        checkpoint = {
+            'vertices': list(self.vertices),
+            'edges': dict(self.edges),
+            'directed': self.directed
+        }
+        with self.lock:
+            self.history.append(('checkpoint', checkpoint))
+            self.redo_history.clear()
+
+    def load_checkpoint(self):
+        """Load the last saved checkpoint."""
+        with self.lock:
+            for i in range(len(self.history) - 1, -1, -1):
+                if self.history[i][0] == 'checkpoint':
+                    checkpoint = self.history[i][1]
+                    self.vertices = set(checkpoint['vertices'])
+                    self.edges = defaultdict(list, checkpoint['edges'])
+                    self.directed = checkpoint['directed']
+                    self.history = self.history[:i + 1]
+                    self.redo_history.clear()
+                    return
+
+    def visualize(self, is_3d=False, highlight_path=None):
+        """Visualize the graph using matplotlib and networkx. Optionally in 3D."""
+        g = nx.DiGraph() if self.directed else nx.Graph()
+        for vertex, neighbors in self.edges.items():
+            for neighbor, weight in neighbors:
+                g.add_edge(vertex, neighbor, weight=weight)
+
+        if is_3d:
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+            pos = nx.spring_layout(g, dim=3)
+            for key, value in pos.items():
+                ax.scatter(value[0], value[1], value[2], s=500, label=key)
+            nx.draw_networkx_edges(g, pos, ax=ax)
+            if highlight_path:
+                path_edges = [(highlight_path[i], highlight_path[i + 1]) for i in range(len(highlight_path) - 1)]
+                nx.draw_networkx_edges(g, pos, edgelist=path_edges, ax=ax, edge_color='r', width=2.0)
+            plt.legend()
+        else:
+            pos = nx.spring_layout(g)
+            nx.draw(g, pos, with_labels=True, node_color='lightblue', node_size=500, font_size=10)
+            labels = nx.get_edge_attributes(g, 'weight')
+            nx.draw_networkx_edge_labels(g, pos, edge_labels=labels)
+            if highlight_path:
+                path_edges = [(highlight_path[i], highlight_path[i + 1]) for i in range(len(highlight_path) - 1)]
+                nx.draw_networkx_edges(g, pos, edgelist=path_edges, edge_color='r', width=2.0)
+
+        plt.show()
+
+    def upload_to_s3(self, filename):
+        """Upload the graph data to AWS S3."""
+        try:
+            s3 = boto3.client('s3')
+            self.save_graph(filename)
+            s3.upload_file(filename, 'your-bucket-name', filename)
+        except Exception as e:
+            raise ValueError(f"Failed to upload graph to S3: {e}")
+
+    def upload_to_azure(self, filename):
+        """Upload the graph data to Azure Blob Storage."""
+        try:
+            # Add Azure SDK code here for uploading
+            pass
+        except Exception as e:
+            raise ValueError(f"Failed to upload graph to Azure: {e}")
+
+    def upload_to_gcp(self, filename):
+        """Upload the graph data to Google Cloud Storage."""
+        try:
+            # Add Google Cloud SDK code here for uploading
+            pass
+        except Exception as e:
+            raise ValueError(f"Failed to upload graph to GCP: {e}")
+
+    def download_from_s3(self, filename):
+        """Download the graph data from AWS S3."""
+        try:
+            s3 = boto3.client('s3')
+            s3.download_file('your-bucket-name', filename, filename)
+            self.load_graph(filename)
+        except Exception as e:
+            raise ValueError(f"Failed to download graph from S3: {e}")
+
+    def minimum_cut(self, source, sink):
+        """Find minimum cut between source and sink using Ford-Fulkerson algorithm."""
+        g = nx.DiGraph()
+        for u in self.edges:
+            for v, w in self.edges[u]:
+                g.add_edge(u, v, capacity=w)
+
+        cut_value, partition = nx.minimum_cut(g, source, sink)
+        reachable, non_reachable = partition
+        cutset = [(u, v) for u in reachable for v in g.neighbors(u) if v in non_reachable]
+
+        return cut_value, cutset
+
+    def parallel_bfs(self, start):
+        """Parallel Breadth-First Search."""
+        visited = set()
+        queue = deque([start])
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            while queue:
+                futures = [executor.submit(self._process_vertex, queue, visited) for _ in range(len(queue))]
+                for future in futures:
+                    result = future.result()
+                    if result:
+                        queue.extend(result)
+
+    def _process_vertex(self, queue, visited):
+        vertex = queue.popleft()
+        if vertex not in visited:
+            visited.add(vertex)
+            return [neighbor for neighbor, _ in self.edges[vertex] if neighbor not in visited]
+        return None
+
+    def simulate_traffic(self, start, iterations=100):
+        """Simulate traffic flow in the graph."""
+        traffic = {vertex: 0 for vertex in self.vertices}
+        for _ in range(iterations):
+            current_vertex = start
+            while True:
+                neighbors = self.edges.get(current_vertex, [])
+                if not neighbors:
+                    break
+                next_vertex = min(neighbors, key=lambda x: traffic[x[0]])[0]
+                traffic[next_vertex] += 1
+                current_vertex = next_vertex
+        return traffic
+
+    def simulate_epidemic(self, infected_start, infection_rate=0.3, recovery_rate=0.1, steps=50):
+        """Simulate epidemic spread on the graph."""
+        states = {vertex: 'S' for vertex in self.vertices}  # Susceptible, Infected, Recovered
+        states[infected_start] = 'I'
+        history = [states.copy()]
+
+        for _ in range(steps):
+            new_states = states.copy()
+            for vertex in self.vertices:
+                if states[vertex] == 'I':
+                    for neighbor, _ in self.edges.get(vertex, []):
+                        if states[neighbor] == 'S' and random.random() < infection_rate:
+                            new_states[neighbor] = 'I'
+                    if random.random() < recovery_rate:
+                        new_states[vertex] = 'R'
+            states = new_states
+            history.append(states.copy())
+
+        return history
+
+    def analyze_centrality(self):
+        """Analyze centrality metrics of the graph."""
+        g = nx.DiGraph() if self.directed else nx.Graph()
+        for vertex, neighbors in self.edges.items():
+            for neighbor, weight in neighbors:
+                g.add_edge(vertex, neighbor, weight=weight)
+
+        degree_centrality = nx.degree_centrality(g)
+        betweenness_centrality = nx.betweenness_centrality(g)
+        closeness_centrality = nx.closeness_centrality(g)
+        eigenvector_centrality = nx.eigenvector_centrality(g)
+
+        return {
+            'degree': degree_centrality,
+            'betweenness': betweenness_centrality,
+            'closeness': closeness_centrality,
+            'eigenvector': eigenvector_centrality
+        }
+
+    def analyze_clustering_coefficient(self):
+        """Analyze clustering coefficients of the graph."""
+        g = nx.DiGraph() if self.directed else nx.Graph()
+        for vertex, neighbors in self.edges.items():
+            for neighbor, weight in neighbors:
+                g.add_edge(vertex, neighbor, weight=weight)
+
+        clustering_coefficients = nx.clustering(g)
+
+        return clustering_coefficients
+
+    def detect_cycles(self):
+        """Detect cycles in the graph."""
+        def dfs(vertex, visited, stack):
+            visited.add(vertex)
+            stack.add(vertex)
+            for neighbor, _ in self.edges[vertex]:
+                if neighbor not in visited:
+                    if dfs(neighbor, visited, stack):
+                        return True
+                elif neighbor in stack:
+                    return True
+            stack.remove(vertex)
+            return False
+
+        visited = set()
+        stack = set()
+        for vertex in self.vertices:
+            if vertex not in visited:
+                if dfs(vertex, visited, stack):
+                    return True
+        return False
+
+    def kruskal_mst(self):
+        """Find the Minimum Spanning Tree (MST) using Kruskal's algorithm."""
+        edges = [(w, u, v) for u in self.edges for v, w in self.edges[u]]
+        edges.sort()
+        parent = {v: v for v in self.vertices}
+
+        def find(v):
+            if parent[v] != v:
+                parent[v] = find(parent[v])
+            return parent[v]
+
+        mst = []
+        for weight, u, v in edges:
+            root_u = find(u)
+            root_v = find(v)
+            if root_u != root_v:
+                mst.append((u, v, weight))
+                parent[root_u] = root_v
+
+        return mst
+
+    def perform_pagerank(self, alpha=0.85):
+        """Perform PageRank algorithm to determine importance of vertices."""
+        g = nx.DiGraph() if self.directed else nx.Graph()
+        for vertex, neighbors in self.edges.items():
+            for neighbor, weight in neighbors:
+                g.add_edge(vertex, neighbor, weight=weight)
+
+        pagerank = nx.pagerank(g, alpha=alpha)
+        return pagerank
+
+    def spectral_clustering(self, k=2):
+        """Perform spectral clustering on the graph."""
+        g = nx.Graph()
+        for vertex, neighbors in self.edges.items():
+            for neighbor, weight in neighbors:
+                g.add_edge(vertex, neighbor, weight=weight)
+
+        adjacency_matrix = nx.to_numpy_array(g)
+        laplacian_matrix = nx.laplacian_matrix(g).toarray()
+        eigenvalues, eigenvectors = np.linalg.eigh(laplacian_matrix)
+        idx = eigenvalues.argsort()[:k]
+        clusters = eigenvectors[:, idx]
+        labels = np.argmax(clusters, axis=1)
+
+        return labels
+
+    def girvan_newman(self):
+        """Apply Girvan-Newman algorithm for community detection."""
+        g = nx.Graph()
+        for vertex, neighbors in self.edges.items():
+            for neighbor, weight in neighbors:
+                g.add_edge(vertex, neighbor, weight=weight)
+
+        communities = list(nx.community.girvan_newman(g))
+        return communities
+
+    def markov_chain_simulation(self, steps=100):
+        """Simulate a Markov chain on the graph."""
+        transition_matrix = np.zeros((len(self.vertices), len(self.vertices)))
+        vertex_index = {v: i for i, v in enumerate(self.vertices)}
+
+        for u in self.edges:
+            total_weight = sum(weight for _, weight in self.edges[u])
+            for v, weight in self.edges[u]:
+                transition_matrix[vertex_index[u]][vertex_index[v]] = weight / total_weight
+
+        current_state = np.zeros(len(self.vertices))
+        current_state[0] = 1  # Start at first vertex
+
+        history = [current_state]
+        for _ in range(steps):
+            current_state = current_state.dot(transition_matrix)
+            history.append(current_state)
+
+        return history
+
+    def genetic_algorithm_optimization(self, objective_function, population_size=50, generations=100):
+        """Optimize a problem using a genetic algorithm."""
+        def mutate(solution):
+            idx = np.random.randint(len(solution))
+            solution[idx] = 1 - solution[idx]
+            return solution
+
+        def crossover(parent1, parent2):
+            point = np.random.randint(len(parent1))
+            return np.concatenate([parent1[:point], parent2[point:]])
+
+        population = [np.random.randint(0, 2, len(self.vertices)) for _ in range(population_size)]
+        best_solution = max(population, key=objective_function)
+
+        for _ in range(generations):
+            population = sorted(population, key=objective_function, reverse=True)
+            new_population = population[:population_size // 2]
+
+            while len(new_population) < population_size:
+                parent1, parent2 = np.random.choice(new_population, 2, replace=False)
+                offspring = mutate(crossover(parent1, parent2))
+                new_population.append(offspring)
+
+            best_solution = max(new_population, key=objective_function)
+
+        return best_solution
+
+    # Real-time Graph Updates via WebSocket
+    async def update_graph_from_stream(self, uri):
+        """Real-time updates to the graph structure from a WebSocket stream."""
+        async with websockets.connect(uri) as websocket:
+            while True:
+                update = await websocket.recv()
+                command, from_vertex, to_vertex, weight = update.split()
+                self.add_edge(from_vertex, to_vertex, float(weight))
+
+    def predict_next_connection(self, vertex, model):
+        """Predict the next likely connection using a machine learning model."""
+        neighbors = model.predict(self.get_vertex_features(vertex))
+        return neighbors
+
+    def stream_updates(self):
+        """Stream graph updates from a WebSocket."""
+        uri = "ws://example.com/graph-updates"
+        asyncio.run(self.update_graph_from_stream(uri))
+
+    def start_ml_training(self):
+        """Start training a machine learning model on the graph data."""
+        model = tf.keras.Sequential([
+            tf.keras.layers.Dense(64, activation='relu'),
+            tf.keras.layers.Dense(64, activation='relu'),
+            tf.keras.layers.Dense(len(self.vertices), activation='softmax')
+        ])
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy')
+        # Prepare your training data and start the training process
+
+class GraphAnalyticsDashboard:
+    def __init__(self, graph):
+        self.graph = graph
+        self.app = Flask(__name__)
+
+    def start_dashboard(self):
+        """Start the analytics dashboard using Flask."""
+        @self.app.route('/stats')
+        def stats():
+            return jsonify({
+                'num_vertices': len(self.graph.vertices),
+                'num_edges': sum(len(v) for v in self.graph.edges.values())
+            })
+
+        @self.app.route('/centrality')
+        def centrality():
+            centrality_metrics = self.graph.analyze_centrality()
+            return jsonify(centrality_metrics)
+
+        self.app.run(debug=True)
+
+class GraphUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Advanced Graph Management Tool")
+        self.graph = Graph()
+
+        self.add_edge_button = tk.Button(master, text="Add Edge", command=self.add_edge)
+        self.add_edge_button.pack()
+
+        self.remove_edge_button = tk.Button(master, text="Remove Edge", command=self.remove_edge)
+        self.remove_edge_button.pack()
+
+        self.update_edge_button = tk.Button(master, text="Update Edge", command=self.update_edge)
+        self.update_edge_button.pack()
+
+        self.remove_vertex_button = tk.Button(master, text="Remove Vertex", command=self.remove_vertex)
+        self.remove_vertex_button.pack()
+
+        self.visualize_button = tk.Button(master, text="Visualize", command=self.visualize)
+        self.visualize_button.pack()
+
+        self.run_dijkstra_button = tk.Button(master, text="Run Dijkstra", command=self.run_dijkstra)
+        self.run_dijkstra_button.pack()
+
+        self.run_a_star_button = tk.Button(master, text="Run A*", command=self.run_a_star)
+        self.run_a_star_button.pack()
+
+        self.run_bellman_button = tk.Button(master, text="Run Bellman-Ford", command=self.run_bellman)
+        self.run_bellman_button.pack()
+
+        self.find_components_button = tk.Button(master, text="Find Connected Components", command=self.find_connected_components)
+        self.find_components_button.pack()
+
+        self.check_bipartite_button = tk.Button(master, text="Check Bipartite", command=self.check_bipartite)
+        self.check_bipartite_button.pack()
+
+        self.save_graph_button = tk.Button(master, text="Save Graph", command=self.save_graph)
+        self.save_graph_button.pack()
+
+        self.load_graph_button = tk.Button(master, text="Load Graph", command=self.load_graph)
+        self.load_graph_button.pack()
+
+        self.undo_button = tk.Button(master, text="Undo", command=self.undo)
+        self.undo_button.pack()
+
+        self.redo_button = tk.Button(master, text="Redo", command=self.redo)
+        self.redo_button.pack()
+
+        self.stats_button = tk.Button(master, text="Graph Stats", command=self.show_stats)
+        self.stats_button.pack()
+
+        self.customize_ui_button = tk.Button(master, text="Customize UI", command=self.customize_ui)
+        self.customize_ui_button.pack()
+
+        self.save_checkpoint_button = tk.Button(master, text="Save Checkpoint", command=self.save_checkpoint)
+        self.save_checkpoint_button.pack()
+
+        self.load_checkpoint_button = tk.Button(master, text="Load Checkpoint", command=self.load_checkpoint)
+        self.load_checkpoint_button.pack()
+
+        self.upload_cloud_button = tk.Button(master, text="Upload to Cloud", command=self.upload_to_cloud)
+        self.upload_cloud_button.pack()
+
+        self.download_cloud_button = tk.Button(master, text="Download from Cloud", command=self.download_from_cloud)
+        self.download_cloud_button.pack()
+
+        self.minimum_cut_button = tk.Button(master, text="Run Minimum Cut", command=self.run_minimum_cut)
+        self.minimum_cut_button.pack()
+
+        self.parallel_bfs_button = tk.Button(master, text="Run Parallel BFS", command=self.run_parallel_bfs)
+        self.parallel_bfs_button.pack()
+
+        self.simulate_traffic_button = tk.Button(master, text="Simulate Traffic", command=self.run_simulate_traffic)
+        self.simulate_traffic_button.pack()
+
+        self.simulate_epidemic_button = tk.Button(master, text="Simulate Epidemic", command=self.run_simulate_epidemic)
+        self.simulate_epidemic_button.pack()
+
+        self.analyze_centrality_button = tk.Button(master, text="Analyze Centrality", command=self.run_analyze_centrality)
+        self.analyze_centrality_button.pack()
+
+        self.detect_cycles_button = tk.Button(master, text="Detect Cycles", command=self.run_detect_cycles)
+        self.detect_cycles_button.pack()
+
+        self.kruskal_mst_button = tk.Button(master, text="Run Kruskal MST", command=self.run_kruskal_mst)
+        self.kruskal_mst_button.pack()
+
+        self.pagerank_button = tk.Button(master, text="Perform PageRank", command=self.run_pagerank)
+        self.pagerank_button.pack()
+
+        self.spectral_clustering_button = tk.Button(master, text="Spectral Clustering", command=self.run_spectral_clustering)
+        self.spectral_clustering_button.pack()
+
+        self.girvan_newman_button = tk.Button(master, text="Girvan-Newman", command=self.run_girvan_newman)
+        self.girvan_newman_button.pack()
+
+        self.markov_chain_button = tk.Button(master, text="Markov Chain", command=self.run_markov_chain)
+        self.markov_chain_button.pack()
+
+        self.genetic_algorithm_button = tk.Button(master, text="Genetic Algorithm", command=self.run_genetic_algorithm)
+        self.genetic_algorithm_button.pack()
+
+        self.random_walk_button = tk.Button(master, text="Random Walk", command=self.run_random_walk)
+        self.random_walk_button.pack()
+
+        self.hamiltonian_path_button = tk.Button(master, text="Hamiltonian Path", command=self.run_hamiltonian_path)
+        self.hamiltonian_path_button.pack()
+
+        self.dominating_set_button = tk.Button(master, text="Find Dominating Set", command=self.run_dominating_set)
+        self.dominating_set_button.pack()
+
+        self.start_ml_training_button = tk.Button(master, text="Start ML Training", command=self.start_ml_training)
+        self.start_ml_training_button.pack()
+
+        self.stream_updates_button = tk.Button(master, text="Stream Updates", command=self.stream_updates)
+        self.stream_updates_button.pack()
+
+        self.analytics_dashboard_button = tk.Button(master, text="Analytics Dashboard", command=self.start_analytics_dashboard)
+        self.analytics_dashboard_button.pack()
+
+    def add_edge(self):
+        from_vertex = simpledialog.askstring("Input", "Enter from vertex:")
+        to_vertex = simpledialog.askstring("Input", "Enter to vertex:")
+        weight = simpledialog.askfloat("Input", "Enter weight:")
+        self.graph.add_edge(from_vertex, to_vertex, weight)
+
+    def remove_edge(self):
+        from_vertex = simpledialog.askstring("Input", "Enter from vertex:")
+        to_vertex = simpledialog.askstring("Input", "Enter to vertex:")
+        self.graph.remove_edge(from_vertex, to_vertex)
+
+    def update_edge(self):
+        from_vertex = simpledialog.askstring("Input", "Enter from vertex:")
+        to_vertex = simpledialog.askstring("Input", "Enter to vertex:")
+        weight = simpledialog.askfloat("Input", "Enter new weight:")
+        self.graph.update_edge(from_vertex, to_vertex, weight)
+
+    def remove_vertex(self):
+        vertex = simpledialog.askstring("Input", "Enter vertex to remove:")
+        self.graph.remove_vertex(vertex)
+
+    def visualize(self):
+        is_3d = messagebox.askyesno("Visualization", "Would you like to view the graph in 3D?")
+        self.graph.visualize(is_3d=is_3d)
+
+    def run_dijkstra(self):
+        start_vertex = simpledialog.askstring("Input", "Enter start vertex:")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future = executor.submit(self.graph.dijkstra, start_vertex)
+            distances = future.result()
+        messagebox.showinfo("Dijkstra Result", str(distances))
+        path = simpledialog.askstring("Input", "Enter the shortest path (comma-separated vertices):")
+        if path:
+            path = path.split(',')
+            self.graph.visualize(highlight_path=path)
+
+    def run_a_star(self):
+        start_vertex = simpledialog.askstring("Input", "Enter start vertex:")
+        goal_vertex = simpledialog.askstring("Input", "Enter goal vertex:")
+        heuristic_code = simpledialog.askstring("Input", "Enter heuristic function code:")
+        exec(f"def heuristic(node, goal): {heuristic_code}")
+        path = self.graph.a_star(start_vertex, goal_vertex, heuristic)
+        messagebox.showinfo("A* Result", f"Shortest path: {path}")
+        self.graph.visualize(highlight_path=path)
+
+    def run_bellman(self):
+        start_vertex = simpledialog.askstring("Input", "Enter start vertex:")
+        try:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                future = executor.submit(self.graph.bellman_ford, start_vertex)
+                distances = future.result()
+            messagebox.showinfo("Bellman-Ford Result", str(distances))
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+
+    def find_connected_components(self):
+        components = self.graph.find_connected_components()
+        messagebox.showinfo("Connected Components", f"Components: {components}")
+
+    def check_bipartite(self):
+        is_bipartite = self.graph.is_bipartite()
+        messagebox.showinfo("Bipartite Check", f"The graph is bipartite: {is_bipartite}")
+
+    def save_graph(self):
+        formats = [("JSON files", "*.json"), ("CSV files", "*.csv"), ("XML files", "*.xml"), ("Binary files", "*.bin")]
+        filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=formats)
+        if filename:
+            if filename.endswith('.json'):
+                self.graph.save_graph(filename)
+            elif filename.endswith('.csv'):
+                self.graph.save_to_csv(filename)
+            elif filename.endswith('.xml'):
+                self.graph.save_to_xml(filename)
+            elif filename.endswith('.bin'):
+                self.graph.save_to_binary(filename)
+
+    def load_graph(self):
+        formats = [("JSON files", "*.json"), ("CSV files", "*.csv"), ("XML files", "*.xml"), ("Binary files", "*.bin")]
+        filename = filedialog.askopenfilename(filetypes=formats)
+        if filename:
+            if filename.endswith('.json'):
+                self.graph.load_graph(filename)
+            elif filename.endswith('.csv'):
+                self.graph.load_from_csv(filename)
+            elif filename.endswith('.xml'):
+                self.graph.load_from_xml(filename)
+            elif filename.endswith('.bin'):
+                self.graph.load_from_binary(filename)
+
+    def undo(self):
+        self.graph.undo()
+        messagebox.showinfo("Undo", "Last action undone.")
+
+    def redo(self):
+        self.graph.redo()
+        messagebox.showinfo("Redo", "Last action redone.")
+
+    def show_stats(self):
+        num_vertices = len(self.graph.vertices)
+        num_edges = sum(len(v) for v in self.graph.edges.values())
+        stats = f"Vertices: {num_vertices}\nEdges: {num_edges}\nDirected: {self.graph.directed}"
+        messagebox.showinfo("Graph Stats", stats)
+
+    def customize_ui(self):
+        """Allow the user to customize the UI appearance."""
+        bg_color = simpledialog.askstring("Customize UI", "Enter background color (e.g., #000000):")
+        fg_color = simpledialog.askstring("Customize UI", "Enter foreground color (e.g., #FFFFFF):")
+        font = simpledialog.askstring("Customize UI", "Enter font (e.g., Arial):")
+        if bg_color:
+            self.master.configure(bg=bg_color)
+        if fg_color:
+            for widget in self.master.winfo_children():
+                widget.configure(fg=fg_color)
+        if font:
+            for widget in self.master.winfo_children():
+                widget.configure(font=(font, 12))
+
+    def save_checkpoint(self):
+        self.graph.save_checkpoint()
+        messagebox.showinfo("Checkpoint", "Checkpoint saved.")
+
+    def load_checkpoint(self):
+        self.graph.load_checkpoint()
+        messagebox.showinfo("Checkpoint", "Checkpoint loaded.")
+
+    def upload_to_cloud(self):
+        platform = simpledialog.askstring("Input", "Enter cloud platform (AWS/Azure/GCP):")
+        filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+        if filename:
+            if platform.lower() == "aws":
+                self.graph.upload_to_s3(filename)
+            elif platform.lower() == "azure":
+                self.graph.upload_to_azure(filename)
+            elif platform.lower() == "gcp":
+                self.graph.upload_to_gcp(filename)
+
+    def download_from_cloud(self):
+        platform = simpledialog.askstring("Input", "Enter cloud platform (AWS/Azure/GCP):")
+        filename = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+        if filename:
+            if platform.lower() == "aws":
+                self.graph.download_from_s3(filename)
+            elif platform.lower() == "azure":
+                # Add Azure download logic here
+                pass
+            elif platform.lower() == "gcp":
+                # Add GCP download logic here
+                pass
+
+    def run_minimum_cut(self):
+        source = simpledialog.askstring("Input", "Enter source vertex:")
+        sink = simpledialog.askstring("Input", "Enter sink vertex:")
+        try:
+            cut_value, cutset = self.graph.minimum_cut(source, sink)
+            messagebox.showinfo("Minimum Cut Result", f"Cut value: {cut_value}\nCut edges: {cutset}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def run_parallel_bfs(self):
+        start_vertex = simpledialog.askstring("Input", "Enter start vertex:")
+        self.graph.parallel_bfs(start_vertex)
+        messagebox.showinfo("Parallel BFS", "Parallel BFS completed.")
+
+    def run_simulate_traffic(self):
+        start_vertex = simpledialog.askstring("Input", "Enter start vertex:")
+        iterations = simpledialog.askinteger("Input", "Enter number of iterations:", initialvalue=100)
+        traffic = self.graph.simulate_traffic(start_vertex, iterations)
+        messagebox.showinfo("Traffic Simulation", str(traffic))
+
+    def run_simulate_epidemic(self):
+        infected_start = simpledialog.askstring("Input", "Enter infected start vertex:")
+        infection_rate = simpledialog.askfloat("Input", "Enter infection rate:", initialvalue=0.3)
+        recovery_rate = simpledialog.askfloat("Input", "Enter recovery rate:", initialvalue=0.1)
+        steps = simpledialog.askinteger("Input", "Enter number of steps:", initialvalue=50)
+        history = self.graph.simulate_epidemic(infected_start, infection_rate, recovery_rate, steps)
+        messagebox.showinfo("Epidemic Simulation", str(history[-1]))
+
+    def run_analyze_centrality(self):
+        centrality = self.graph.analyze_centrality()
+        messagebox.showinfo("Centrality Analysis", f"Degree: {centrality['degree']}\nBetweenness: {centrality['betweenness']}\nCloseness: {centrality['closeness']}\nEigenvector: {centrality['eigenvector']}")
+
+    def run_detect_cycles(self):
+        has_cycle = self.graph.detect_cycles()
+        messagebox.showinfo("Cycle Detection", f"The graph has a cycle: {has_cycle}")
+
+    def run_kruskal_mst(self):
+        mst = self.graph.kruskal_mst()
+        messagebox.showinfo("Kruskal MST", f"Minimum Spanning Tree edges: {mst}")
+
+    def run_pagerank(self):
+        pagerank = self.graph.perform_pagerank()
+        messagebox.showinfo("PageRank", f"PageRank: {pagerank}")
+
+    def run_spectral_clustering(self):
+        k = simpledialog.askinteger("Input", "Enter number of clusters (k):", initialvalue=2)
+        labels = self.graph.spectral_clustering(k)
+        messagebox.showinfo("Spectral Clustering", f"Cluster labels: {labels}")
+
+    def run_girvan_newman(self):
+        communities = self.graph.girvan_newman()
+        messagebox.showinfo("Girvan-Newman", f"Communities: {communities}")
+
+    def run_markov_chain(self):
+        steps = simpledialog.askinteger("Input", "Enter number of steps:", initialvalue=100)
+        history = self.graph.markov_chain_simulation(steps)
+        messagebox.showinfo("Markov Chain Simulation", f"Markov Chain History: {history}")
+
+    def run_genetic_algorithm(self):
+        population_size = simpledialog.askinteger("Input", "Enter population size:", initialvalue=50)
+        generations = simpledialog.askinteger("Input", "Enter number of generations:", initialvalue=100)
+        def objective_function(solution):
+            return np.sum(solution)
+        best_solution = self.graph.genetic_algorithm_optimization(objective_function, population_size, generations)
+        messagebox.showinfo("Genetic Algorithm", f"Best Solution: {best_solution}")
+
+    def run_random_walk(self):
+        start_vertex = simpledialog.askstring("Input", "Enter start vertex:")
+        steps = simpledialog.askinteger("Input", "Enter number of steps:", initialvalue=100)
+        walk = self.graph.random_walk(start_vertex, steps)
+        messagebox.showinfo("Random Walk", f"Random walk: {walk}")
+
+    def run_hamiltonian_path(self):
+        path = self.graph.hamiltonian_path()
+        messagebox.showinfo("Hamiltonian Path", f"Hamiltonian path: {path}")
+
+    def run_dominating_set(self):
+        dominating_set = self.graph.find_dominating_set()
+        messagebox.showinfo("Dominating Set", f"Dominating set: {dominating_set}")
+
+    def start_ml_training(self):
+        """Start the machine learning training."""
+        self.graph.start_ml_training()
+        messagebox.showinfo("ML Training", "Machine Learning training started.")
+
+    def stream_updates(self):
+        """Start streaming updates."""
+        self.graph.stream_updates()
+        messagebox.showinfo("Stream Updates", "Streaming updates started.")
+
+    def start_analytics_dashboard(self):
+        """Start the analytics dashboard."""
+        dashboard = GraphAnalyticsDashboard(self.graph)
+        dashboard.start_dashboard()
+
+root = tk.Tk()
+app = GraphUI(root)
+root.mainloop() 
